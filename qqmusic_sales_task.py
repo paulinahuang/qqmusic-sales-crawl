@@ -7,14 +7,14 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
 )
 
 SALE_KEYWORDS = ("sale", "sales", "sold", "sell", "buy", "order", "销量", "pay")
@@ -35,6 +35,15 @@ NOISE_TOKENS = (
     "play",
     "like",
 )
+
+
+@dataclass
+class SalesNotFoundError(Exception):
+    message: str
+    inspected: dict[str, Any]
+
+    def __str__(self) -> str:
+        return self.message
 
 
 class QQMusicSalesCrawler:
@@ -79,7 +88,7 @@ class QQMusicSalesCrawler:
             add_from_text(key, final_url)
             add_from_text(key, html)
 
-        return {"ids": ids, "final_url": final_url, "html": html}
+        return {"ids": ids, "final_url": final_url}
 
     def _musicu_call(self, payload: dict[str, Any]) -> dict[str, Any]:
         encoded = urlencode({"format": "json", "data": json.dumps(payload, ensure_ascii=False)})
@@ -159,7 +168,7 @@ class QQMusicSalesCrawler:
             )
         return payloads
 
-    def probe_with_playwright(self, share_url: str, wait_ms: int = 5000) -> list[dict[str, Any]]:
+    def probe_with_playwright(self, share_url: str, wait_ms: int = 12000, headed: bool = False) -> list[dict[str, Any]]:
         try:
             from playwright.sync_api import sync_playwright
         except Exception as exc:
@@ -168,8 +177,8 @@ class QQMusicSalesCrawler:
         records: list[dict[str, Any]] = []
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=UA)
+            browser = p.chromium.launch(headless=not headed)
+            context = browser.new_context(user_agent=UA, viewport={"width": 390, "height": 844})
             page = context.new_page()
 
             def handle_response(resp: Any) -> None:
@@ -177,29 +186,31 @@ class QQMusicSalesCrawler:
                 if "qq.com" not in low_url:
                     return
                 ctype = (resp.headers.get("content-type", "") or "").lower()
-                if not ("json" in ctype or "fcg" in low_url or "cgi" in low_url or "musicu" in low_url):
-                    return
-                if any(t in low_url for t in ("getcmcount", "comment", "feed")):
+                is_interesting = "json" in ctype or any(t in low_url for t in ("fcg", "cgi", "musicu", "putao", "product"))
+                if not is_interesting:
                     return
 
+                basic = {"url": resp.url, "status": resp.status, "content_type": ctype}
                 try:
                     data = json.loads(self._strip_jsonp(resp.text()))
                 except Exception:
+                    records.append({**basic, "hits": [], "broad_hits": [], "parse_error": True})
                     return
 
                 exact_hits = self._collect_exact_sales_candidates(data)
                 broad_hits = self._collect_numeric_candidates(data)
-                if exact_hits or broad_hits:
-                    records.append(
-                        {
-                            "url": resp.url,
-                            "hits": sorted(exact_hits, key=lambda x: x[1], reverse=True)[:20],
-                            "broad_hits": sorted(broad_hits, key=lambda x: x[1], reverse=True)[:50],
-                        }
-                    )
+                records.append(
+                    {
+                        **basic,
+                        "hits": sorted(exact_hits, key=lambda x: x[1], reverse=True)[:20],
+                        "broad_hits": sorted(broad_hits, key=lambda x: x[1], reverse=True)[:50],
+                    }
+                )
 
             page.on("response", handle_response)
-            page.goto(share_url, wait_until="networkidle", timeout=60_000)
+            page.goto(share_url, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(3000)
+            page.mouse.wheel(0, 2500)
             page.wait_for_timeout(wait_ms)
             context.close()
             browser.close()
@@ -207,34 +218,40 @@ class QQMusicSalesCrawler:
         return records
 
     def _pick_fallback_from_broad_hits(self, records: list[dict[str, Any]], min_value: int) -> tuple[str, int] | None:
-        pool: list[tuple[str, int, str]] = []
+        pool: list[tuple[int, int, str, int]] = []
         for rec in records:
-            url = rec["url"]
+            url = rec.get("url", "")
             for path, val in rec.get("broad_hits", []):
-                if val < min_value:
-                    continue
-                if val > max(min_value * 50, 1_000_000):
+                if val < min_value or val > max(min_value * 80, 3_000_000):
                     continue
                 low = path.lower()
                 score = 0
-                for token in ("sale", "sold", "buy", "order", "pay", "total", "cnt", "num"):
+                for token in ("sale", "sold", "buy", "order", "pay", "total", "cnt", "num", "amount"):
                     if token in low:
                         score += 1
-                if "product" in low or "album" in low:
-                    score += 1
-                pool.append((path, val, f"fallback:{url}::{path}::{score}"))
+                if any(t in low for t in ("product", "album", "goods", "sku")):
+                    score += 2
+                pool.append((score, val, f"fallback:{url}::{path}", val))
 
         if not pool:
             return None
-        pool.sort(key=lambda x: (x[2].split("::")[-1], -x[1]), reverse=True)
-        best_path, best_val, src = pool[0]
-        return src.replace("::" + src.split("::")[-1], ""), best_val
 
-    def fetch_precise_sales(self, share_url: str, use_browser_probe: bool = False, min_value: int = 1) -> tuple[int, dict[str, Any]]:
+        pool.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        _, val, src, _ = pool[0]
+        return src, val
+
+    def fetch_precise_sales(
+        self,
+        share_url: str,
+        use_browser_probe: bool = False,
+        min_value: int = 1,
+        probe_wait_ms: int = 12000,
+        headed: bool = False,
+    ) -> tuple[int, dict[str, Any]]:
         context = self.resolve_album_context(share_url)
         ids = context["ids"]
         if not ids:
-            raise RuntimeError("无法从链接中解析专辑/商品 ID，请确认链接有效。")
+            raise SalesNotFoundError("无法从链接中解析专辑/商品 ID，请确认链接有效。", {"ids": ids, **context})
 
         inspected: dict[str, Any] = {"ids": ids, "final_url": context["final_url"], "api_candidates": [], "browser_records": []}
         best: tuple[str, int] | None = None
@@ -248,13 +265,12 @@ class QQMusicSalesCrawler:
 
             hits = self._collect_exact_sales_candidates(data, min_value=min_value)
             inspected["api_candidates"].append({"payload": payload, "hits": sorted(hits, key=lambda x: x[1], reverse=True)[:20], "top_keys": list(data.keys())[:10] if isinstance(data, dict) else []})
-
             for p, v in hits:
                 if best is None or v > best[1]:
                     best = (f"api:{p}", v)
 
         if use_browser_probe:
-            records = self.probe_with_playwright(share_url)
+            records = self.probe_with_playwright(share_url, wait_ms=probe_wait_ms, headed=headed)
             inspected["browser_records"] = records
             for rec in records:
                 for p, v in rec.get("hits", []):
@@ -268,7 +284,7 @@ class QQMusicSalesCrawler:
 
         if best is None:
             suffix = "（你已开启 --browser-probe）" if use_browser_probe else "（可尝试加 --browser-probe）"
-            raise RuntimeError(f"未找到精确销量字段{suffix}。请查看 debug 中的 api_candidates/browser_records。")
+            raise SalesNotFoundError(f"未找到精确销量字段{suffix}。请查看 debug 中的 api_candidates/browser_records。", inspected)
 
         return best[1], {"source_path": best[0], **inspected}
 
@@ -279,11 +295,24 @@ def main() -> int:
     parser.add_argument("--debug", action="store_true", help="输出调试信息")
     parser.add_argument("--browser-probe", action="store_true", help="使用 Playwright 监听网页真实接口")
     parser.add_argument("--min-value", type=int, default=1, help="销量候选最小值（可设为 10000）")
+    parser.add_argument("--probe-wait-ms", type=int, default=12000, help="浏览器探测额外等待时间（毫秒）")
+    parser.add_argument("--headed", action="store_true", help="以可视化浏览器模式运行探测（本地排查更直观）")
     args = parser.parse_args()
 
     crawler = QQMusicSalesCrawler()
     try:
-        sales, meta = crawler.fetch_precise_sales(args.url, use_browser_probe=args.browser_probe, min_value=args.min_value)
+        sales, meta = crawler.fetch_precise_sales(
+            args.url,
+            use_browser_probe=args.browser_probe,
+            min_value=args.min_value,
+            probe_wait_ms=args.probe_wait_ms,
+            headed=args.headed,
+        )
+    except SalesNotFoundError as exc:
+        print(f"[ERROR] {exc}")
+        if args.debug:
+            print(json.dumps(exc.inspected, ensure_ascii=False, indent=2))
+        return 1
     except Exception as exc:
         print(f"[ERROR] {exc}")
         return 1
