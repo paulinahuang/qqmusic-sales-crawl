@@ -41,4 +41,5 @@ playwright install chromium
 ## 重要说明
 
 - 脚本只接受**纯数字或数字型字段**作为精确销量候选。像 `1w+`、`1.5万` 这类展示值不会被当作最终结果。
+- 脚本会过滤明显噪声字段（如 `count_ver`、评论计数、trace/version 等），避免把非销量数字误判为销量。
 - 如果你看到“未找到精确销量字段”，一般表示需要打开 `--browser-probe` 并查看 `browser_records` 中的实际返回结构。

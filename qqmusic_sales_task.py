@@ -29,10 +29,13 @@ SALE_KEYWORDS = (
     "sell",
     "buy",
     "order",
-    "count",
-    "num",
-    "volume",
     "销量",
+    "pay",
+)
+
+NOISE_TOKENS = (
+    "trace", "ts", "time", "version", "_ver", "uuid", "guid", "eid",
+    "uin", "userid", "comment", "cmcount", "view", "play", "like",
 )
 
 
@@ -95,6 +98,8 @@ class QQMusicSalesCrawler:
 
         def score_key(k: str, p: str) -> bool:
             key = (k + " " + p).lower()
+            if any(noise in key for noise in NOISE_TOKENS):
+                return False
             return any(word in key for word in SALE_KEYWORDS)
 
         if isinstance(obj, dict):
@@ -102,13 +107,15 @@ class QQMusicSalesCrawler:
                 sub = f"{path}.{k}" if path else k
                 if isinstance(v, bool):
                     continue
-                if isinstance(v, int) and v >= min_value and score_key(k, sub):
+                if isinstance(v, int) and v >= min_value and v <= 1_000_000_000 and score_key(k, sub):
                     hits.append((sub, v))
                 elif isinstance(v, str):
                     # 仅接受纯数字字符串，拒绝 1w+ / 1.5万 这类近似展示
                     raw = v.strip().replace(",", "")
                     if raw.isdigit() and score_key(k, sub):
-                        hits.append((sub, int(raw)))
+                        val = int(raw)
+                        if val <= 1_000_000_000:
+                            hits.append((sub, val))
 
                     if raw.startswith("{") or raw.startswith("["):
                         try:
@@ -192,9 +199,13 @@ class QQMusicSalesCrawler:
 
             def handle_response(resp: Any) -> None:
                 url = resp.url
-                if "y.qq.com" not in url and "qq.com" not in url:
+                low_url = url.lower()
+                if "y.qq.com" not in low_url and "qq.com" not in low_url:
                     return
-                if not ("musicu.fcg" in url or "fcg" in url or "cgi" in url):
+                allow_tokens = ("musicu", "musicmall", "vipmall", "putao", "product", "digital", "album")
+                if not any(t in low_url for t in allow_tokens):
+                    return
+                if "getcmcount" in low_url:
                     return
 
                 try:
