@@ -1,4 +1,4 @@
-# QQ 音乐专辑精确销量目标 
+# QQ Music Exact Sales Crawling Project
 This warehouse provides a directly executable task script: Input the sharing link of the QQ music album, automatically parse the album ID, and attempt to call the public interface of QQ music to retrieve the "precise sales figures". 
 ## Operating Mode 
 ```bash
